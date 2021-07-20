@@ -1,0 +1,214 @@
+---
+title: "Explainer"
+author: "Erik van Zwet"
+header-includes:
+  - \usepackage{amsmath}
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+urlcolor: blue
+---
+
+
+```{r set-options, echo=FALSE}
+#options(width = 2000)
+```
+
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+library(dplyr)
+library(ggplot2)
+library(flexmix)  # for fitting normal mixture
+
+set.seed(123)  # for reproducibility
+
+dmix = function(x,p,m,s){    # density of normal mixture
+p %*% sapply(x, function(x) dnorm(x,mean=m,sd=s))
+}
+```
+
+
+# Set-up
+This note is meant as a quick explainer of a set of three pre-prints at [The Shrinkage Trilogy](https://statmodeling.stat.columbia.edu/2020/12/02/the-shrinkage-trilogy-how-to-be-bayesian-in-analyzing-simple-experiments/). All three have the same simple set-up: We abstract a "study" as a triple (beta,b,s) where 
+
+* beta is the parameter of interest
+* b is an unbiased, normally distributed estimate of beta
+* s is the standard error of b.
+
+In other words, we are assuming that our estimate b has the normal distribution with mean beta and standard deviation s. We do not observe beta, but we do observe the pair (b,s).
+
+We define the z-value z=b/s and the signal-to-noise ratio SNR=beta/s. Note that the z-value is the sum of the SNR and independent standard normal "noise". This means that the distribution of the z-value is the _convolution_ of the distribution of the SNR with the standard normal density.
+
+It is not difficult to estimate the distribution of z-values if we have a sample of study results from a particular field of study. Subsequently, we can obtain the distribution of the SNRs in that field by _deconvolution_. Moreover, we also know the _conditional_ distribution of the z-value given the SNR; it's just normal with mean SNR and standard deviation 1. So, we can actually get the _joint_ distribution of the z-value and the SNR. 
+
+So, we're going to estimate the distribution of z=b/s, deconvolve to get the distribution of SNR=beta/s and scale that distribution by s to get a prior for beta given s. We can then use conjugate theory the posterior of beta, given b and s. The posterior mean of beta is a useful shrinkage estimator. Shrinkage is very important, because the signal-to-noise ratio is often very low and therefore |b| tends to overestimate (exaggerate) |beta|. This is especially bad when we condition on statistical significance (|z|>1.96).  
+
+# z-value and SNR
+
+To estimate the distribution of the z-value in some particular field of research, we need an "honest" sample that is free from publication bias, file drawer effect, fishing, forking paths etc. Recently, Barnett and Wren (2019) collected more than a million confidence intervals from Medline publications (data are [here](https://github.com/agbarnett/intervals/)). We converted those to z-values and display the histogram below. The striking shortage of z-values between -2 and 2 suggests strong publication bias. This biased sample of z-values is **not** suitable for our purpose. 
+
+Simon Schwab (2020) collected more than 20,000 z-values from RCTs from the Cochrane database (data are [here](https://osf.io/xjv9g/)). The histogram shows much less publication bias. This may be due to the fact that many studies in the Cochrane database are pre-registered, and to the efforts of the Cochrane collaboration to find unpublished results. 
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+load(url("https://github.com/agbarnett/intervals/raw/master/data/Georgescu.Wren.RData"))
+complete=complete[complete$mistake==0,]
+L=log(complete$lower)
+U=log(complete$upper)
+crit=-qnorm((1-complete$ci.level)/2)
+se=(U-L)/(2*crit)
+b=(L+U)/2
+z=b/se
+df=data.frame(z=z[abs(z)<10],label="Medline (Barnett and Wren, 2019)")
+```
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE, fig.width=8, fig.height=3}
+data=read.csv("https://osf.io/xq4b2/?action=download")
+d=data %>% filter(RCT=="yes")
+d=d[d$outcome.group=="efficacy" & d$outcome.nr==1 & abs(d$z)<20,]
+d=group_by(d,study.id.sha1) %>% sample_n(size=1)   # select single outcome per study 
+z=d$z
+#cat("number of z-values:",length(z),"\n")
+#cat("proportion significant:",mean(abs(z)>1.96),"\n")
+
+fit=flexmix(z ~ 1, k = 3)           # estimate distribution of z=b/s
+p=summary(fit)@comptab$prior        # mixture proportions
+mu=parameters(fit)[1,]              # mixture means
+sigma=parameters(fit)[2,]           # mixture standard deviations
+
+x=seq(-10,10,0.01)
+n=length(z)
+df=rbind(df,data.frame(z=z[abs(z)<10],label="Cochrane (vZ, Schwab and Senn, 2020)"))
+d1=data.frame(x,y=drop(dmix(x,p=p,m=mu,s=sigma)),label="Cochrane (vZ, Schwab and Senn, 2020)")
+
+ggplot(df, aes(x=z, y=..density..)) +
+  geom_histogram(bins=40,fill="white",col="black") + 
+  xlim(-10, 10) + theme_bw() + labs(x="z-value",y="") +
+  geom_line(data=d1,aes(x=x,y=y)) + facet_grid(. ~ label)
+
+```
+
+We fitted a mixture of 3 normal distributions to the z-values from the Cochrane database. We show the fit in the histogram above, and note that it is quite satisfactory.
+
+```{r, warning=FALSE, message=FALSE, echo=TRUE}
+fit=flexmix::flexmix(z ~ 1, k = 3)  # estimate mixture distribution of z
+p=summary(fit)@comptab$prior        # mixture proportions
+mu=parameters(fit)[1,]              # mixture means
+sigma=parameters(fit)[2,]           # mixture standard deviations
+round(data.frame(p,mu,sigma),2)
+```
+
+We can now get the distribution of the SNR by _deconvolution_ of the distribution of the z-value  with the standard normal distribution. Deconvolution is not easy in general, but in our case it is trivial. Since we estimated the distribution of the z-value as a normal mixture, we can simply subtract 1 from the variances of the mixture components. We plot the densities of z and SNR together, and see that the density of the z-value is a "smeared-out" version of the density of the SNR.
+
+```{r, warning=FALSE, message=FALSE, echo=TRUE}
+tau=sqrt(sigma^2-1); round(tau,2)  # deconvolution; standard deviations of the SNR  
+```
+```{r, warning=FALSE, message=FALSE, echo=FALSE, fig.width=6, fig.height=3}
+x=seq(-10,10,0.01)
+df=data.frame(x,dens=drop(dmix(x,p,mu,tau)),density="SNR")
+df=rbind(df,data.frame(x,dens=drop(dmix(x,p,mu,sigma)),density="z-value"))
+ggplot(df,aes(x=x, y=dens, colour=density)) + geom_line() +
+  xlab("") + ylab("") + theme_bw()
+```
+
+
+# Power
+The power of the two-sided test of H_0 : beta=0 at level 5% is
+
+P(|z|>1.96 | beta,s) = pnorm(SNR-1.96) + 1 - pnorm(SNR+1.96).
+
+Since the power is just a function of the SNR, we can transform a sample from the distribution of the SNR into a sample from the distribution of the power (see also the histogram below).
+
+```{r, warning=FALSE, message=FALSE, echo=TRUE}
+rmix = function(n,p,mean,sd){   # sample from a normal mixture
+  d=rmultinom(n,1,p)
+  rnorm(n,mean%*%d,sd%*%d)
+}
+snr=rmix(10^6,p,mu,tau) 
+power=pnorm(snr - 1.96) + 1 - pnorm(snr + 1.96)
+S=summary(power); round(S,2)
+```
+
+We see that the median power across the Cochrane database is about 14%, while the average power is about 28%. The average power can be interpreted as the probability that a randomly selected result from the Cochrane collection is significant. And indeed, 29% of our z-values exceeds 1.96 in absolute value. The fact that the (achieved) power is often very low should not surprise us, see [The "80% power" lie](https://statmodeling.stat.columbia.edu/2017/12/04/80-power-lie/). However, it also does not imply that the usual sample size calculations aiming for 80% or 90% power are necessarily wrong. The goal of such calculations is to have high power against a particular alternative that is considered to be of clinical interest -- the effect "you would not want to miss". That high power is often not achieved just goes to show that medical research is hard, and treatments often do not provide the benefit that was hoped for.
+
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE, fig.width=8, fig.height=3}
+df=data.frame(power=power)
+ggplot(df, aes(x=power, y=..density..)) +
+  geom_histogram(bins=40,fill="white",col="black") + 
+  xlim(0, 1) + theme_bw() + labs(x="power",y="")
+```
+
+
+It is also possible to condition the power on a specific z-value. This will allow us assess the probability that the replication of a specific result will be significant.
+
+
+# Exaggeration
+
+Low power is a serious problem as it leads to overestimation of effects (type M error) and over-confidence about their sign (type S error), see [This is what "power = .06" looks like. Get used to it.](https://statmodeling.stat.columbia.edu/2014/11/17/power-06-looks-like-get-used/) 
+
+The "exaggeration ratio" is |b/beta| = |z/SNR|. Since it is just a function of the z-value and the SNR, we can easily get a sample from its distribution (see also the histogram below).
+
+```{r, warning=FALSE, message=FALSE, echo=TRUE}
+z=rnorm(10^6,snr,1)
+exaggeration=abs(z/snr)
+Q=quantile(exaggeration,c(0.1,0.25,0.5,0.75,0.9))
+round(Q,2)
+```
+
+We see that the median exaggeration is 1.23. That means that half the studies overestimate the effect by at least 23%.
+
+It is also possible to condition the exaggeration on a specific z-value. This will allow us assess the exaggeration of a specific estimate. We can then correct for this by shrinking the estimate.
+
+# Shrinkage
+
+We can use shrinkage (regularization) to correct the exaggeration. We have estimated the distribution of the SNR as a normal mixture parameterized by (p,mu,tau). Recalling that SNR=beta/s, we scale this distribution by s to get a distribution for beta. So, the distribution of beta is a normal mixture parameterized by (p,s\*mu,s\*tau).
+
+We can now compute the conditional (or posterior) distribution of beta given the pair (b,s). It is again a normal mixture distribution.
+
+```{r, warning=FALSE, message=FALSE, echo=TRUE}
+posterior = function(b,s,p,mu,sd){  # compute conditional distr of beta given (b,s)
+                                    # mixture distr of beta given by (p,mu,sd)
+  s2=s^2
+  sd2=sd^2
+  q=p*dnorm(b,mu,sqrt(sd2+s2))      # conditional mixing probs
+  q=q/sum(q)
+  pm=(mu*s2 + b*sd2)/(sd2+s2)       # conditional means
+  pv=sd2*s2/(sd2+s2)                # conditional variances
+  ps=sqrt(pv)                       # conditional std devs
+  data.frame(q,pm,ps)
+}
+```
+
+As an example, we compute the conditional (posterior) distribution of the beta given b=2 and s=1. It is a normal mixture with the following parameters:
+
+```{r, warning=FALSE, message=FALSE, echo=TRUE}
+b=2; s=1
+post=posterior(b,s,p,s*mu,s*tau)
+round(post,2)
+```
+
+In particular, we can use the conditional (posterior) mean as an estimator.
+
+```{r, warning=FALSE, message=FALSE, echo=TRUE}
+post.mean=sum(post$q * post$pm) 
+round(post.mean,2)              # posterior mean of beta
+round(post.mean/b,2)            # shrinkage factor
+```
+
+
+# Conclusion
+
+Low power is very common. It leads to overestimation of effects (a.k.a. exaggeration, inflation or type M error) which must be corrected by shrinkage. For more details, we refer to [The Shrinkage Trilogy](https://statmodeling.stat.columbia.edu/2020/12/02/the-shrinkage-trilogy-how-to-be-bayesian-in-analyzing-simple-experiments/). Here we end with three remarks.
+
+1. Undoubtedly, the Cochrane database suffers from at least some publication bias, file drawer effects, fishing, forking paths etc. Unfortunately, this means that the power is likely to be _even_ lower and the exaggeration _even_ greater.
+
+2. Strictly speaking, our analysis concerns the results in the Cochrane database. However, we believe that problems of low power and exaggeration are similar -- if not worse -- in many other areas of research.
+
+3. Our estimate of the distribution of the SNR is quite close to the standard Cauchy distribution, which we recommend as a default prior without reference to the Cochrane database. Of course, nothing beats real, substantive prior information that is specific to the study of interest.
+
+
+```{r, echo=FALSE}
+knitr::knit_exit()
+```
